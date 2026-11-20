@@ -147,7 +147,6 @@ async function getAuthUri(redirectUri: string, state: string) {
     client_id: OIDC_CLIENT_ID,
     response_type: "code",
     scope: OIDC_SCOPES,
-    prompt: "consent",
     redirect_uri: redirectUri,
     state: state,
   });
