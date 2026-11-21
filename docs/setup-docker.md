@@ -60,6 +60,11 @@ docker run -d \
   the adapter never redirects a user to a meeting without a JWT. Keep
   `ENABLE_GUESTS=false` in Jitsi when guest access is not allowed.
 
+  Silent sign-in can only reuse a Keycloak session available in the browser
+  context that opens the provider. On mobile and Electron, that is the system
+  browser used by the existing app handoff. Keycloak's session idle and maximum
+  lifetimes still apply; this flow does not extend them.
+
   **Important:** When `true`, certain OIDC providers may cause a "broken tab"
   issue (see [#1](https://github.com/jitsi-contrib/jitsi-oidc-adapter/pull/1))
   on Chromium-based Android browsers (Chrome, Brave, etc.) when returning to the
