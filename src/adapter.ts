@@ -29,6 +29,7 @@ let USERINFO_ENDPOINT = "";
 let CRYPTO_KEY: CryptoKey;
 
 interface StateType {
+  adapterAuthMode?: "silent" | "interactive";
   android?: boolean;
   electron?: boolean;
   ios?: boolean;
@@ -43,6 +44,15 @@ const enum ClientType {
   electron,
   browser,
 }
+
+// These OIDC errors mean that silent authentication could not continue without
+// user interaction. They should fall back to the normal Keycloak login page.
+const SILENT_AUTH_INTERACTION_ERRORS = new Set([
+  "account_selection_required",
+  "consent_required",
+  "interaction_required",
+  "login_required",
+]);
 
 // -----------------------------------------------------------------------------
 // Detect the client type by using the state data coming from the client.
@@ -154,9 +164,6 @@ async function getAuthUri(
     redirect_uri: redirectUri,
     state: state,
   });
-
-  // Keep the fork's session-reuse behavior for regular logins: only send a
-  // prompt when the caller explicitly requests silent authentication.
   if (prompt) params.set("prompt", prompt);
 
   return `${AUTH_ENDPOINT}?${params.toString()}`;
@@ -166,25 +173,38 @@ async function getAuthUri(
 // Redirect the user to the OIDC auth page to get the short-term auth code.
 // -----------------------------------------------------------------------------
 async function auth(req: Request): Promise<Response> {
-  const host = req.headers.get("host");
-  const url = new URL(req.url);
-  const state = url.searchParams.get("state");
-
   try {
+    const host = req.headers.get("host");
     if (!host) throw new Error("host not found");
-    if (!state) throw new Error("state not found");
 
-    const prompt = url.searchParams.get("prompt") === "none"
-      ? "none"
-      : undefined;
+    const url = new URL(req.url);
+    const incomingState = url.searchParams.get("state");
+    if (!incomingState) throw new Error("state not found");
+
+    const state = parseState(incomingState);
+    // Override this internal marker so callers cannot skip the silent-first
+    // behavior or force a fallback state.
+    state.adapterAuthMode = "silent";
+    const serializedState = JSON.stringify(state);
+
     const redirectUri = `https://${host}/oidc/tokenize`;
-    const authPage = await getAuthUri(redirectUri, state, prompt);
+    const authPage = await getAuthUri(redirectUri, serializedState, "none");
 
     return Response.redirect(authPage, STATUS_CODE.Found);
   } catch (e) {
     console.error(e);
-    return returnAsGuest(host, state);
+    return unauthorized();
   }
+}
+
+// Parse and validate the JSON state used by the Jitsi authentication flow.
+function parseState(value: string): StateType {
+  const state = JSON.parse(value);
+  if (!state || typeof state !== "object" || Array.isArray(state)) {
+    throw new Error("invalid state");
+  }
+
+  return state as StateType;
 }
 
 // -----------------------------------------------------------------------------
@@ -334,7 +354,7 @@ function getMeetingUri(
   host: string,
   tenant: string | undefined,
   room: string,
-  jwt: string | undefined,
+  jwt: string,
   hash: string,
   client: ClientType,
 ): string {
@@ -351,9 +371,7 @@ function getMeetingUri(
 
   let uri = `${host}/${tenant}/${room}`;
   uri = uri.replace(/\/+/g, "/");
-  uri = `${scheme}://${uri}`;
-  if (jwt) uri += `?jwt=${jwt}`;
-  uri += `#${hash}`;
+  uri = `${scheme}://${uri}?jwt=${jwt}#${hash}`;
   if (client == ClientType.android) {
     uri += "#Intent;scheme=org.jitsi.meet;package=org.jitsi.meet;end";
   }
@@ -401,39 +419,6 @@ function generateTokenizeResponse(uri: string, client: ClientType): Response {
 }
 
 // -----------------------------------------------------------------------------
-// If login cannot complete (for example prompt=none with no active IdP
-// session), send the participant back to the same meeting as a guest.
-// -----------------------------------------------------------------------------
-function returnAsGuest(
-  host: string | null,
-  jsonState: string | null,
-): Response {
-  try {
-    if (!host) throw new Error("host not found");
-    if (!jsonState) throw new Error("state not found");
-
-    const state = JSON.parse(jsonState) as StateType;
-    if (!state.room) throw new Error("room not found in state");
-
-    const client = detectClientType(state);
-    const hash = generateHash(jsonState);
-    const uri = getMeetingUri(
-      host,
-      state.tenant,
-      state.room,
-      undefined,
-      hash,
-      client,
-    );
-
-    return generateTokenizeResponse(uri, client);
-  } catch (e) {
-    console.error(e);
-    return unauthorized();
-  }
-}
-
-// -----------------------------------------------------------------------------
 // - User comes here after redirected by the auth page with a short-term code
 // - Get the OIDC access token by using this short-term auth code
 // - Get the OIDC user info by using the access code
@@ -441,27 +426,43 @@ function returnAsGuest(
 // - Redirect the user to Jitsi's meeting page with a token and hashes
 // -----------------------------------------------------------------------------
 async function tokenize(req: Request): Promise<Response> {
-  const host = req.headers.get("host");
-  const url = new URL(req.url);
-  const searchParams = url.searchParams;
-  const jsonState = searchParams.get("state");
-
   try {
+    const host = req.headers.get("host");
     if (!host) throw new Error("host not found");
+
+    const url = new URL(req.url);
+    const searchParams = url.searchParams;
+
+    const jsonState = searchParams.get("state");
     if (!jsonState) throw new Error("state not found");
 
-    // Keycloak returns an OIDC error instead of a code when prompt=none cannot
-    // complete (for example, when there is no active Keycloak session).
-    const error = searchParams.get("error");
-    if (error) throw new Error(`login failed: ${error}`);
+    const state = parseState(jsonState);
+    const room = state.room;
+    if (!room) throw new Error("room not found in state");
+
+    const oidcError = searchParams.get("error");
+    if (oidcError) {
+      // A prompt=none request can fail when the browser has no usable IdP
+      // session. Retry the same request interactively, once. Every other OIDC
+      // failure is terminal: never send the client to a tokenless meeting.
+      if (
+        state.adapterAuthMode === "silent" &&
+        SILENT_AUTH_INTERACTION_ERRORS.has(oidcError)
+      ) {
+        state.adapterAuthMode = "interactive";
+        const redirectUri = `https://${host}/oidc/tokenize`;
+        const authPage = await getAuthUri(redirectUri, JSON.stringify(state));
+        return Response.redirect(authPage, STATUS_CODE.Found);
+      }
+
+      console.error(`OIDC authorization failed: ${oidcError}`);
+      return unauthorized();
+    }
 
     const code = searchParams.get("code");
     if (!code) throw new Error("code not found");
 
-    const state = JSON.parse(jsonState) as StateType;
     const sub = getSub(host, state.tenant);
-    const room = state.room;
-    if (!room) throw new Error("room not found in state");
 
     // Detect client type
     const client = detectClientType(state);
@@ -480,57 +481,8 @@ async function tokenize(req: Request): Promise<Response> {
     return generateTokenizeResponse(uri, client);
   } catch (e) {
     console.error(e);
-    return returnAsGuest(host, jsonState);
+    return unauthorized();
   }
-}
-
-// -----------------------------------------------------------------------------
-// Jitsi loads this script in plugin.head.html before initializing the meeting.
-// It silently requests an OIDC token for a room if the browser already has an
-// authenticated provider session. With no session, /oidc/tokenize returns the
-// user to the meeting as a guest.
-// -----------------------------------------------------------------------------
-function silentLogin(): Response {
-  const body = `
-    function oidcSilentLogin() {
-      const url = new URL(window.location.href);
-      if (url.searchParams.has("jwt")) return;
-
-      const params = url.hash.substring(1).split("&").filter(Boolean);
-      if (params.includes("adapter=true")) return;
-
-      const folders = url.pathname.split("/");
-      const room = folders.pop();
-      if (!room) return;
-
-      const tenant = folders.filter(Boolean).join("/");
-      const state = { room: room, tenant: tenant };
-
-      // Preserve supported Jitsi config overrides in the fragment.
-      for (const param of params) {
-        const [key, value = ""] = param.split("=");
-        const name = decodeURIComponent(key);
-
-        try {
-          state[name] = JSON.parse(decodeURIComponent(value));
-        } catch {
-          state[name] = decodeURIComponent(value);
-        }
-      }
-
-      window.location.replace(
-        "/oidc/auth?prompt=none&state=" +
-          encodeURIComponent(JSON.stringify(state)),
-      );
-    }
-
-    oidcSilentLogin();`;
-
-  const headers = new Headers();
-  headers.append("Content-Type", "text/javascript");
-  headers.append("Cache-Control", "max-age=3600");
-
-  return new Response(body, { headers: headers });
 }
 
 // -----------------------------------------------------------------------------
@@ -550,8 +502,6 @@ async function handler(req: Request): Promise<Response> {
     return await auth(req);
   } else if (path === "/oidc/tokenize") {
     return await tokenize(req);
-  } else if (path === "/oidc/silent-login.js") {
-    return silentLogin();
   } else {
     return notFound();
   }

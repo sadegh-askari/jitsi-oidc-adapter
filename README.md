@@ -17,13 +17,10 @@ to provide more general OIDC support.
 - SSO for Jitsi through an OIDC provider. Allows Jitsi to run as an OIDC
   consumer.
 - Better integration with Jitsi's built-in features for authentication flow.
-- Allows guest users and `wait for host` screen if needed.
-- Optional silent sign-in in the web client. If the browser already has an
-  active session with the OIDC provider, Jitsi receives a token without showing
-  the provider's login page. If there is no session, the user returns as a
-  guest and can still choose the normal sign-in flow. The early page hook is
-  web-only; native mobile clients continue to use the adapter's existing login
-  flow, which can reuse a Keycloak session when available.
+- Guest access is controlled by Jitsi configuration. Authentication errors are
+  never converted to a guest meeting.
+- Silent-first OIDC sign-in with interactive Keycloak fallback. Authentication
+  failures never send a participant to a guest meeting.
 
 ## 2. Setup
 

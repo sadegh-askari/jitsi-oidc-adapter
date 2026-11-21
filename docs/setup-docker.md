@@ -1,11 +1,12 @@
 # Dockerized setup
 
+**NOT READY YET**
+
 - [1. OIDC Adapter](#1-oidc-adapter)
 - [2. Jitsi](#2-jitsi)
   - [2.1 OIDC adapter as a proxy](#21-oidc-adapter-as-a-proxy)
   - [2.2 Token authentication](#22-token-authentication)
   - [2.3 Guest participants](#23-guest-participants)
-  - [2.4 Silent login (optional)](#24-silent-login-optional)
 
 The setup guide to integrate `Jitsi OIDC Adapter` with a Dockerized Jitsi setup.
 
@@ -49,6 +50,15 @@ docker run -d \
   initiating Jitsi app (Android, iOS or Electron) after authentication. If
   `false`, users must manually click a link in the final step to return. This
   setting does not affect the web client.
+
+- Authentication first uses OIDC `prompt=none`. If Keycloak reports that
+  interaction is required, the adapter retries the same meeting through the
+  regular Keycloak login flow. This is handled by the existing
+  `TOKEN_AUTH_URL`/`/oidc/auth` path, so it also applies to the official desktop
+  and mobile apps without rebuilding them. The meeting room and the client's
+  return scheme are preserved. Any other authentication error fails closed;
+  the adapter never redirects a user to a meeting without a JWT. Keep
+  `ENABLE_GUESTS=false` in Jitsi when guest access is not allowed.
 
   **Important:** When `true`, certain OIDC providers may cause a "broken tab"
   issue (see [#1](https://github.com/jitsi-contrib/jitsi-oidc-adapter/pull/1))
@@ -130,28 +140,3 @@ activate "wait for host" feature:
 - Enable the wait for host module
 
   `XMPP_MUC_MODULES=muc_wait_for_host`
-
-### 2.4 Silent login (optional)
-
-The web client can reuse an existing OIDC provider session without showing its
-login page. If there is no active provider session, the visitor returns to the
-meeting as a guest. The regular Jitsi sign-in flow remains available.
-
-Create `~/.jitsi-meet-cfg/web/plugin.head.html` with this plain script tag. Do
-not add `async` or `defer`; Jitsi must load it before initializing the meeting.
-
-```html
-<script src="/oidc/silent-login.js"></script>
-```
-
-Mount the file into the Jitsi `web` container by adding this volume to its
-`docker-compose.yml` service:
-
-```yaml
-- ${CONFIG}/web/plugin.head.html:/usr/share/jitsi-meet/plugin.head.html:ro,Z
-```
-
-The adapter's `/oidc/silent-login.js` endpoint sends `prompt=none` to the OIDC
-provider. Normal sign-in does not send a prompt value, preserving this fork's
-Keycloak session reuse behavior. The page hook applies to browsers; native
-Android and iOS apps continue to use the existing app authentication flow.
